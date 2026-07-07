@@ -1,5 +1,6 @@
 // Manage module — customization and drawing cleanup tools.
 
+mod about;
 mod audit;
 mod cui_export;
 mod cui_import;
@@ -74,6 +75,11 @@ impl CadModule for ManageModule {
                         RibbonItem::Tool(overkill::tool()),
                         RibbonItem::Tool(audit::tool()),
                     ],
+                },
+                // ── Info ──────────────────────────────────────────────────────────
+                RibbonGroup {
+                    title: "Info",
+                    tools: vec![RibbonItem::LargeTool(about::tool())],
                 },
             ]
         })

@@ -1,6 +1,5 @@
 // Draw module — Draw, Modify, Annotation and Layer tools.
 
-mod about;
 mod changelog;
 pub mod clipboard;
 pub mod defaults;
