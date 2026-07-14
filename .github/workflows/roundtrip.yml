@@ -77,11 +77,16 @@ jobs:
           grep -q "Loaded plugin: Land Survey" roundtrip-test.log || {
             echo "::error::no positive evidence the plugin actually loaded"; exit 1; }
 
+      - name: Set up Python for the PDF checker
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Verify exported PDF vector content
         shell: bash
         run: |
-          python3 -m pip install --quiet pymupdf numpy
-          python3 tools/check_roundtrip_pdf.py tests/fixtures/roundtrip_plan.json "roundtrip-${{ matrix.os }}.pdf"
+          python -m pip install --quiet pymupdf numpy
+          python tools/check_roundtrip_pdf.py tests/fixtures/roundtrip_plan.json "roundtrip-${{ matrix.os }}.pdf"
 
       - name: Upload exported PDF (inspection artifact)
         uses: actions/upload-artifact@v4
