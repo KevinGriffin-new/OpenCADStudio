@@ -13,6 +13,8 @@ mod history;
 mod layers;
 mod model_ops;
 mod mtext_editor;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod plan_roundtrip;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod plugin_host;
 mod properties;
