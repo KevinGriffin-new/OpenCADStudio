@@ -1,0 +1,143 @@
+# Fork-side macOS signing pipeline.
+#
+# Lives on KevinGriffin-new/OpenCADStudio ONLY — never merge into upstream.
+# Watches upstream (HakanSeven12/OpenCADStudio) for newly published releases,
+# builds the release tag, signs + notarizes with the Developer ID stored in
+# THIS fork's secrets, and uploads the dmg + sha256 to the UPSTREAM release.
+#
+# Rationale: upstream has no Apple developer account (releases are ad-hoc
+# signed, which breaks the QuickLook appex and Gatekeeper, see #365). Keeping
+# the certificate in the fork's secrets means no workflow outside this repo
+# can touch the signing identity; upstream just receives finished artifacts.
+#
+# Required secrets (set with `gh secret set -R KevinGriffin-new/OpenCADStudio`):
+#   MACOS_CERT_P12        base64 of the "Developer ID Application" cert+key .p12
+#   MACOS_CERT_PASSWORD   passphrase chosen when exporting the .p12
+#   APPLE_ID              Apple ID email for notarization
+#   APPLE_APP_PASSWORD    app-specific password (appleid.apple.com)
+#   APPLE_TEAM_ID         10-char team id (e.g. from `security find-identity`)
+#   UPSTREAM_RELEASE_PAT  fine-grained PAT, HakanSeven12/OpenCADStudio,
+#                         "Contents: read and write" only — used solely to
+#                         upload assets to the upstream release.
+
+name: Sign macOS release for upstream
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"   # poll upstream every 2h
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to build (e.g. v0.9.0); empty = latest"
+        required: false
+
+env:
+  UPSTREAM: HakanSeven12/OpenCADStudio
+
+jobs:
+  sign:
+    runs-on: macos-14   # Apple Silicon, matches upstream release job
+    permissions: {}      # no fork-repo permissions needed; PAT scopes upstream
+    steps:
+      - name: Find upstream release needing a signed dmg
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_RELEASE_PAT }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release list --repo "$UPSTREAM" --limit 1 \
+                    --json tagName -q '.[0].tagName')
+          fi
+          [ -n "$TAG" ] || { echo "no releases found"; exit 1; }
+          # Skip if a signed dmg is already attached (idempotent poll).
+          if gh release view "$TAG" --repo "$UPSTREAM" --json assets \
+               -q '.assets[].name' | grep -q "macos-arm64-signed.dmg$"; then
+            echo "signed dmg already present on $TAG — nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream tag
+        if: steps.pick.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: HakanSeven12/OpenCADStudio
+          ref: ${{ steps.pick.outputs.tag }}
+
+      - name: Install Rust
+        if: steps.pick.outputs.skip == 'false'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install librsvg
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: brew install librsvg
+
+      - name: Import signing certificate into ephemeral keychain
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC=$RUNNER_TEMP/sign.keychain-db
+          KCPW=$(uuidgen)
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" \
+            -P "$CERT_PW" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KCPW" "$KC"
+          security list-keychains -d user -s "$KC" login.keychain
+          echo "KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Store notary credentials
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials ci-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+
+      - name: Build, sign, notarize
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}" NOTARY_PROFILE=ci-notary \
+            bash packaging/build_macos_signed.sh
+
+      - name: Upload signed dmg to upstream release
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_RELEASE_PAT }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          SRC="dist/OpenCADStudio-v$VERSION-macos-arm64.dmg"
+          # "-signed" suffix: coexists with the CI ad-hoc dmg and is the
+          # marker the poll step checks for idempotency.
+          ASSET="OpenCADStudio-$TAG-macos-arm64-signed.dmg"
+          cp "$SRC" "$ASSET"
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" \
+            --repo "$UPSTREAM" --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" || true
