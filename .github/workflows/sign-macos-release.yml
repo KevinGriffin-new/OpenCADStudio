@@ -85,7 +85,7 @@ jobs:
 
       - name: Checkout upstream tag
         if: steps.pick.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5   # v4 runs on the deprecated Node 20
         with:
           repository: HakanSeven12/OpenCADStudio
           ref: ${{ steps.pick.outputs.tag }}
@@ -121,6 +121,9 @@ jobs:
           CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           set -euo pipefail
+          # An empty/unset secret decodes to an empty file and `security
+          # import` then fails with an opaque "parameters were not valid".
+          [ -n "$CERT_P12" ] || { echo "MACOS_CERT_P12 secret is empty"; exit 1; }
           KC=$RUNNER_TEMP/sign.keychain-db
           KCPW=$(uuidgen)
           security create-keychain -p "$KCPW" "$KC"
