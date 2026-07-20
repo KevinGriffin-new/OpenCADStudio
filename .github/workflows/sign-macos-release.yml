@@ -3,12 +3,28 @@
 # Lives on KevinGriffin-new/OpenCADStudio ONLY — never merge into upstream.
 # Watches upstream (HakanSeven12/OpenCADStudio) for newly published releases,
 # builds the release tag, signs + notarizes with the Developer ID stored in
-# THIS fork's secrets, and uploads the dmg + sha256 to the UPSTREAM release.
+# THIS fork's secrets, and publishes the dmg as a release ON THIS FORK.
+# Upstream can then download it and attach it to the official release
+# manually (the notarization staple travels with the dmg, so re-hosting it
+# is fine) — no collaborator access or cross-repo token needed anywhere.
 #
 # Rationale: upstream has no Apple developer account (releases are ad-hoc
 # signed, which breaks the QuickLook appex and Gatekeeper, see #365). Keeping
 # the certificate in the fork's secrets means no workflow outside this repo
-# can touch the signing identity; upstream just receives finished artifacts.
+# can touch the signing identity.
+#
+# Only tags cut after PR #405 merged (2026-07-17) can be built: earlier tags
+# don't contain packaging/build_macos_signed.sh. Older tags are skipped with
+# a note in the job summary rather than failing.
+#
+# The build deliberately runs without OCS_PATREON_TOKEN — that secret belongs
+# to upstream and is not mirrored here. src/patreon.rs reads it via
+# option_env!, so the build succeeds and the Patreon-gated features are
+# simply inactive. This is disclosed in the release notes.
+#
+# Scheduled runs only happen while Actions is enabled on this fork, and
+# GitHub disables fork cron after 60 days of repository inactivity (it emails
+# a re-enable link). workflow_dispatch is the reliable path.
 #
 # Required secrets (set with `gh secret set -R KevinGriffin-new/OpenCADStudio`):
 #   MACOS_CERT_P12        base64 of the "Developer ID Application" cert+key .p12
@@ -16,9 +32,6 @@
 #   APPLE_ID              Apple ID email for notarization
 #   APPLE_APP_PASSWORD    app-specific password (appleid.apple.com)
 #   APPLE_TEAM_ID         10-char team id (e.g. from `security find-identity`)
-#   UPSTREAM_RELEASE_PAT  fine-grained PAT, HakanSeven12/OpenCADStudio,
-#                         "Contents: read and write" only — used solely to
-#                         upload assets to the upstream release.
 
 name: Sign macOS release for upstream
 
@@ -34,15 +47,24 @@ on:
 env:
   UPSTREAM: HakanSeven12/OpenCADStudio
 
+# Two overlapping polls would both pass the "already signed?" check and then
+# race on `gh release create`. One signing run at a time.
+concurrency:
+  group: sign-macos-release
+  cancel-in-progress: false
+
 jobs:
   sign:
     runs-on: macos-14   # Apple Silicon, matches upstream release job
-    permissions: {}      # no fork-repo permissions needed; PAT scopes upstream
+    timeout-minutes: 120   # notarytool --wait can hang; don't burn 6h on it
+    permissions:
+      contents: write   # create the release + tag on this fork
+      issues: write     # report failed scheduled runs
     steps:
-      - name: Find upstream release needing a signed dmg
+      - name: Find upstream release needing a signed build
         id: pick
         env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_RELEASE_PAT }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TAG="${{ github.event.inputs.tag }}"
@@ -50,11 +72,11 @@ jobs:
             TAG=$(gh release list --repo "$UPSTREAM" --limit 1 \
                     --json tagName -q '.[0].tagName')
           fi
-          [ -n "$TAG" ] || { echo "no releases found"; exit 1; }
-          # Skip if a signed dmg is already attached (idempotent poll).
-          if gh release view "$TAG" --repo "$UPSTREAM" --json assets \
-               -q '.assets[].name' | grep -q "macos-arm64-signed.dmg$"; then
-            echo "signed dmg already present on $TAG — nothing to do"
+          [ -n "$TAG" ] || { echo "no upstream releases found"; exit 1; }
+          # Idempotent poll: skip if this fork already has the signed release.
+          if gh release view "$TAG-signed" --repo "${{ github.repository }}" \
+               >/dev/null 2>&1; then
+            echo "signed release for $TAG already exists — nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -68,20 +90,32 @@ jobs:
           repository: HakanSeven12/OpenCADStudio
           ref: ${{ steps.pick.outputs.tag }}
 
-      - name: Install Rust
+      - name: Check the tag can be signed
+        id: guard
         if: steps.pick.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          if [ -f packaging/build_macos_signed.sh ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.pick.outputs.tag }} predates PR #405 and has no packaging/build_macos_signed.sh — nothing to sign." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install Rust
+        if: steps.guard.outputs.build == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
 
       - name: Install librsvg
-        if: steps.pick.outputs.skip == 'false'
+        if: steps.guard.outputs.build == 'true'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
         run: brew install librsvg
 
       - name: Import signing certificate into ephemeral keychain
-        if: steps.pick.outputs.skip == 'false'
+        if: steps.guard.outputs.build == 'true'
         env:
           CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -101,7 +135,7 @@ jobs:
           echo "KEYCHAIN=$KC" >> "$GITHUB_ENV"
 
       - name: Store notary credentials
-        if: steps.pick.outputs.skip == 'false'
+        if: steps.guard.outputs.build == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
@@ -112,32 +146,72 @@ jobs:
             --password "$APPLE_APP_PASSWORD"
 
       - name: Build, sign, notarize
-        if: steps.pick.outputs.skip == 'false'
+        if: steps.guard.outputs.build == 'true'
         env:
           TAG: ${{ steps.pick.outputs.tag }}
         run: |
           set -euo pipefail
+          # No OCS_PATREON_TOKEN here on purpose — see header comment.
           VERSION="${TAG#v}" NOTARY_PROFILE=ci-notary \
             bash packaging/build_macos_signed.sh
 
-      - name: Upload signed dmg to upstream release
-        if: steps.pick.outputs.skip == 'false'
+      - name: Publish signed dmg as a release on this fork
+        if: steps.guard.outputs.build == 'true'
         env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_RELEASE_PAT }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.pick.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
           SRC="dist/OpenCADStudio-v$VERSION-macos-arm64.dmg"
-          # "-signed" suffix: coexists with the CI ad-hoc dmg and is the
-          # marker the poll step checks for idempotency.
           ASSET="OpenCADStudio-$TAG-macos-arm64-signed.dmg"
           cp "$SRC" "$ASSET"
           shasum -a 256 "$ASSET" > "$ASSET.sha256"
-          gh release upload "$TAG" "$ASSET" "$ASSET.sha256" \
-            --repo "$UPSTREAM" --clobber
+          # Mirror the upstream tag onto the fork (as "<tag>-signed") so the
+          # release points at the exact source it was built from.
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
+            "HEAD:refs/tags/$TAG-signed" || true
+          cat > notes.md <<EOF
+          Developer-ID signed + notarized + stapled macOS arm64 build of
+          [upstream $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG),
+          built unmodified from that tag by
+          [this workflow](https://github.com/${{ github.repository }}/blob/main/.github/workflows/sign-macos-release.yml).
+
+          Safe to re-host: the notarization ticket is stapled to the dmg, so it
+          can be attached to the official upstream release as-is.
+
+          Note: built without \`OCS_PATREON_TOKEN\` (that secret lives in the
+          upstream repo), so Patreon-gated features are inactive in this build.
+          EOF
+          gh release create "$TAG-signed" \
+            --repo "${{ github.repository }}" \
+            --title "Signed macOS build of upstream $TAG" \
+            --notes-file notes.md \
+            --latest=false \
+            "$ASSET" "$ASSET.sha256"
 
       - name: Clean up keychain
         if: always()
         run: |
           [ -n "${KEYCHAIN:-}" ] && security delete-keychain "$KEYCHAIN" || true
+
+      - name: Report failed scheduled run
+        # A failing cron run is otherwise invisible unless the notification
+        # email gets read. One open issue at a time, reused across failures.
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="Signing workflow failing"
+          NUM=$(gh issue list --repo "${{ github.repository }}" --state open \
+                  --search "$TITLE in:title" --json number -q '.[0].number')
+          BODY="Scheduled signing run for \`${TAG:-unknown tag}\` failed: $RUN"
+          if [ -n "$NUM" ]; then
+            gh issue comment "$NUM" --repo "${{ github.repository }}" --body "$BODY"
+          else
+            gh issue create --repo "${{ github.repository }}" \
+              --title "$TITLE" --body "$BODY"
+          fi
