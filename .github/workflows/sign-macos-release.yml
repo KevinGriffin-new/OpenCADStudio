@@ -148,6 +148,36 @@ jobs:
             --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD"
 
+      # Python 3.14's plistlib.load() seeks the stream to sniff the format, and
+      # upstream's entitlements check pipes codesign's output straight into it:
+      #   codesign -d --entitlements - ... | python3 -c '...plistlib.load(sys.stdin.buffer)...'
+      # A pipe isn't seekable, so every build died with "File or stream is not
+      # seekable" once the macos-14-arm64 image moved to 3.14 (2026-09-20).
+      # loads(read()) is version-agnostic and keeps the assertion meaningful —
+      # it still fails if the appex ever loses the sandbox entitlement.
+      # Self-healing: a no-op once upstream's script carries the fix.
+      - name: Patch upstream's plistlib call for Python 3.14
+        if: steps.guard.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          F=packaging/build_macos_signed.sh
+          # Without this, a missing script makes `grep -q` fail, which an `if`
+          # condition swallows — the step would then report "upstream fixed it"
+          # and pass while nothing was checked.
+          [ -f "$F" ] || { echo "$F is missing"; exit 1; }
+          if grep -q 'plistlib\.load(sys\.stdin\.buffer)' "$F"; then
+            perl -pi -e \
+              's/plistlib\.load\(sys\.stdin\.buffer\)/plistlib.loads(sys.stdin.buffer.read())/g' \
+              "$F"
+            grep -q 'plistlib\.loads(sys\.stdin\.buffer\.read())' "$F" \
+              || { echo "patch did not apply"; exit 1; }
+            echo "Patched \`$F\` for Python 3.14 plistlib (upstream bug)." \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Upstream no longer uses plistlib.load on a pipe — patch skipped." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Build, sign, notarize
         if: steps.guard.outputs.build == 'true'
         env:
@@ -201,17 +231,39 @@ jobs:
       - name: Report failed scheduled run
         # A failing cron run is otherwise invisible unless the notification
         # email gets read. One open issue at a time, reused across failures.
+        #
+        # Reporting must never fail the job: this step erroring adds a second
+        # red annotation next to the real one and makes the run page ambiguous
+        # about what actually broke. It used to do exactly that on every run —
+        # issues are disabled on forks by default, so `gh issue list` exited
+        # non-zero and 69 consecutive failures went unreported. The summary is
+        # written first and unconditionally, so the failure is recorded even
+        # when the issue can't be filed.
         if: failure() && github.event_name == 'schedule'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.pick.outputs.tag }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           TITLE="Signing workflow failing"
-          NUM=$(gh issue list --repo "${{ github.repository }}" --state open \
-                  --search "$TITLE in:title" --json number -q '.[0].number')
           BODY="Scheduled signing run for \`${TAG:-unknown tag}\` failed: $RUN"
+          echo "## $TITLE" >> "$GITHUB_STEP_SUMMARY"
+          echo "$BODY" >> "$GITHUB_STEP_SUMMARY"
+
+          # Capture rather than test, so an api outage doesn't get reported as
+          # "issues are disabled" — the two need different follow-up.
+          ISSUES=$(gh repo view "${{ github.repository }}" \
+                     --json hasIssuesEnabled -q .hasIssuesEnabled) || ISSUES="unknown"
+          if [ "$ISSUES" != "true" ]; then
+            echo "Could not file an issue (hasIssuesEnabled=$ISSUES) — reported in this summary only." \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          NUM=$(gh issue list --repo "${{ github.repository }}" --state open \
+                  --search "$TITLE in:title" --json number -q '.[0].number') || NUM=""
           if [ -n "$NUM" ]; then
             gh issue comment "$NUM" --repo "${{ github.repository }}" --body "$BODY"
           else
