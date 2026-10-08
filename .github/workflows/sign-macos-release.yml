@@ -102,6 +102,21 @@ jobs:
             echo "Tag ${{ steps.pick.outputs.tag }} predates PR #405 and has no packaging/build_macos_signed.sh — nothing to sign." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Hotpatch signing script for tags predating upstream fixes
+        if: steps.guard.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          F=packaging/build_macos_signed.sh
+          # Tags cut before upstream fixed the appex entitlement check ship
+          # a version that (a) dumps DER entitlements (missing --xml) and
+          # (b) pipes them straight into plistlib.load, which seeks the
+          # stream — pipes are not seekable on Python 3.14 (runs failed with
+          # io.UnsupportedOperation). Rewrite both to the form upstream main
+          # carries now; both substitutions are no-ops on fixed tags.
+          perl -pi -e 's/codesign -d --entitlements - "/codesign -d --entitlements - --xml "/' "$F"
+          perl -pi -e 's/import plistlib, sys; assert plistlib\.load\(sys\.stdin\.buffer\)/import io, plistlib, sys; assert plistlib.load(io.BytesIO(sys.stdin.buffer.read()))/' "$F"
+          grep -n -- "--entitlements - --xml" "$F"
+
       - name: Install Rust
         if: steps.guard.outputs.build == 'true'
         uses: dtolnay/rust-toolchain@stable
