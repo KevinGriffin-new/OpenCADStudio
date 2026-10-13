@@ -22,6 +22,12 @@
 # option_env!, so the build succeeds and the Patreon-gated features are
 # simply inactive. This is disclosed in the release notes.
 #
+# Release candidates: dispatch with `ref` (a branch, tag or commit on THIS
+# fork) to build that code instead of an upstream release. It is published as
+# a prerelease `rc-<ref>-<sha7>-signed`, never marked latest, so a branch can
+# be tested as a notarized build — and loaded with plugins signed by the same
+# Team ID, which library validation requires — before it goes upstream.
+#
 # Scheduled runs only happen while Actions is enabled on this fork, and
 # GitHub disables fork cron after 60 days of repository inactivity (it emails
 # a re-enable link). workflow_dispatch is the reliable path.
@@ -42,6 +48,9 @@ on:
     inputs:
       tag:
         description: "Upstream release tag to build (e.g. v0.9.0); empty = latest"
+        required: false
+      ref:
+        description: "Release candidate: branch, tag or commit on this fork to build instead (overrides tag)"
         required: false
 
 env:
@@ -67,6 +76,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          REF="${{ github.event.inputs.ref }}"
+          if [ -n "$REF" ]; then
+            # Release candidate from this fork. Pin the commit now so the
+            # checkout, the tag and the notes all name the same code.
+            SHA=$(gh api "repos/${{ github.repository }}/commits/$REF" -q .sha)
+            SLUG=$(printf '%s' "$REF" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+            TAG="rc-$SLUG-${SHA:0:7}"
+            if gh release view "$TAG-signed" --repo "${{ github.repository }}" \
+                 >/dev/null 2>&1; then
+              echo "signed release candidate $TAG already exists — nothing to do"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            {
+              echo "skip=false"
+              echo "kind=rc"
+              echo "tag=$TAG"
+              echo "repo=${{ github.repository }}"
+              echo "checkout=$SHA"
+              echo "ref=$REF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           TAG="${{ github.event.inputs.tag }}"
           if [ -z "$TAG" ]; then
             TAG=$(gh release list --repo "$UPSTREAM" --limit 1 \
@@ -79,16 +111,21 @@ jobs:
             echo "signed release for $TAG already exists — nothing to do"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            {
+              echo "skip=false"
+              echo "kind=release"
+              echo "tag=$TAG"
+              echo "repo=$UPSTREAM"
+              echo "checkout=$TAG"
+            } >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout upstream tag
+      - name: Checkout upstream tag or release candidate
         if: steps.pick.outputs.skip == 'false'
         uses: actions/checkout@v5   # v4 runs on the deprecated Node 20
         with:
-          repository: HakanSeven12/OpenCADStudio
-          ref: ${{ steps.pick.outputs.tag }}
+          repository: ${{ steps.pick.outputs.repo }}
+          ref: ${{ steps.pick.outputs.checkout }}
 
       - name: Check the tag can be signed
         id: guard
@@ -167,21 +204,27 @@ jobs:
         if: steps.guard.outputs.build == 'true'
         env:
           TAG: ${{ steps.pick.outputs.tag }}
+          KIND: ${{ steps.pick.outputs.kind }}
         run: |
           set -euo pipefail
           # No OCS_PATREON_TOKEN here on purpose — see header comment.
-          VERSION="${TAG#v}" NOTARY_PROFILE=ci-notary \
-            bash packaging/build_macos_signed.sh
+          # A release candidate keeps the bundle version from Cargo.toml.
+          if [ "$KIND" = release ]; then export VERSION="${TAG#v}"; fi
+          NOTARY_PROFILE=ci-notary bash packaging/build_macos_signed.sh
 
       - name: Publish signed dmg as a release on this fork
         if: steps.guard.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.pick.outputs.tag }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          REF: ${{ steps.pick.outputs.ref }}
+          SHA: ${{ steps.pick.outputs.checkout }}
         run: |
           set -euo pipefail
-          VERSION="${TAG#v}"
-          SRC="dist/OpenCADStudio-v$VERSION-macos-arm64.dmg"
+          # The script names the dmg after the bundle version, which a release
+          # candidate takes from Cargo.toml — find it rather than predict it.
+          SRC=$(ls dist/OpenCADStudio-v*-macos-arm64.dmg)
           ASSET="OpenCADStudio-$TAG-macos-arm64-signed.dmg"
           cp "$SRC" "$ASSET"
           shasum -a 256 "$ASSET" > "$ASSET.sha256"
@@ -189,6 +232,28 @@ jobs:
           # release points at the exact source it was built from.
           git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
             "HEAD:refs/tags/$TAG-signed" || true
+          if [ "$KIND" = rc ]; then
+            cat > notes.md <<EOF
+          **Release candidate — for testing, not an upstream release.**
+          Developer-ID signed + notarized + stapled macOS arm64 build of
+          \`$REF\` at [\`${SHA:0:7}\`](https://github.com/${{ github.repository }}/commit/$SHA)
+          on this fork, built by
+          [this workflow](https://github.com/${{ github.repository }}/blob/main/.github/workflows/sign-macos-release.yml).
+
+          Library validation is enforced: only plugins signed with the same
+          Team ID load in this build.
+
+          Note: built without \`OCS_PATREON_TOKEN\`, so Patreon-gated features
+          are inactive in this build.
+          EOF
+            gh release create "$TAG-signed" \
+              --repo "${{ github.repository }}" \
+              --title "Signed macOS release candidate: $REF (${SHA:0:7})" \
+              --notes-file notes.md \
+              --prerelease --latest=false \
+              "$ASSET" "$ASSET.sha256"
+            exit 0
+          fi
           cat > notes.md <<EOF
           Developer-ID signed + notarized + stapled macOS arm64 build of
           [upstream $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG),
