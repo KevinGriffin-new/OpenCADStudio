@@ -160,6 +160,28 @@ jobs:
         with:
           targets: aarch64-apple-darwin
 
+      - name: Refresh stale bundled-plugin lock files
+        if: steps.guard.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # A tag can ship a bundled plugin whose own Cargo.lock still pins an
+          # older opencadcodec than crates/ocs_plugin_api names: v2026.42 has
+          # plugins/opencad-python/Cargo.lock on a01df94 after 2b0c1a6b5 moved
+          # the host to 5d4f11a (fixed upstream by HakanSeven12/OpenCADStudio#1888).
+          # The bundle step builds those plugins with --locked, so the macOS
+          # build fails. Refresh only the codec entry, and only when the lock
+          # does not resolve as shipped; a no-op on good tags.
+          for manifest in plugins/*/Cargo.toml; do
+            [ -f "$(dirname "$manifest")/Cargo.lock" ] || continue
+            if cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null 2>&1; then
+              continue
+            fi
+            echo "::warning::$(dirname "$manifest")/Cargo.lock does not match this tag; refreshing its opencadcodec entry"
+            cargo update --manifest-path "$manifest" -p acadrust 2>/dev/null               || cargo update --manifest-path "$manifest" -p opencadcodec
+            cargo metadata --locked --format-version 1 --manifest-path "$manifest" >/dev/null
+            git --no-pager diff --stat -- "$(dirname "$manifest")/Cargo.lock"
+          done
+
       - name: Install librsvg
         if: steps.guard.outputs.build == 'true'
         env:
