@@ -153,6 +153,16 @@ jobs:
           perl -pi -e 's/codesign -d --entitlements - "/codesign -d --entitlements - --xml "/' "$F"
           perl -pi -e 's/import plistlib, sys; assert plistlib\.load\(sys\.stdin\.buffer\)/import io, plistlib, sys; assert plistlib.load(io.BytesIO(sys.stdin.buffer.read()))/' "$F"
           grep -n -- "--entitlements - --xml" "$F"
+          # v2026.42's Python plugin staging script looks for the codec under
+          # its pre-rename package name `opencadcodec`, but that tag's lock
+          # names it `acadrust`, so staging fails ("expected one opencadcodec
+          # source"). Accept both, as upstream 2b8de6280 does; a no-op on tags
+          # that already do.
+          S=plugins/opencad-python/tools/stage-bundled.sh
+          if [ -f "$S" ]; then
+            perl -pi -e 's/\^name = "opencadcodec"\$/^name = "(acadrust|opencadcodec)"\$/' "$S"
+            grep -n 'acadrust|opencadcodec' "$S" || true
+          fi
 
       - name: Install Rust
         if: steps.guard.outputs.build == 'true'
